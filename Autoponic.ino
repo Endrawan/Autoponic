@@ -1,41 +1,32 @@
-/***************************************************
-  DFRobot Gravity: Analog TDS Sensor/Meter
-  <https://www.dfrobot.com/wiki/index.php/Gravity:_Analog_TDS_Sensor_/_Meter_For_Arduino_SKU:_SEN0244>
-
- ***************************************************
-  This sample code shows how to read the tds value and calibrate it with the standard buffer solution.
-  707ppm(1413us/cm)@25^c standard buffer solution is recommended.
-
-  Created 2018-1-3
-  By Jason <jason.ling@dfrobot.com@dfrobot.com>
-
-  GNU Lesser General Public License.
-  See <http://www.gnu.org/licenses/> for details.
-  All above must be included in any redistribution.
- ****************************************************/
-
-/***********Notice and Trouble shooting***************
-  1. This code is tested on Arduino Uno with Arduino IDE 1.0.5 r2 and 1.8.2.
-  2. Calibration CMD:
-    enter -> enter the calibration mode
-    cal:tds value -> calibrate with the known tds value(25^c). e.g.cal:707
-    exit -> save the parameters and exit the calibration mode
-****************************************************/
-
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
 #include <ArduinoJson.h>
 #include "GravityTDS.h"
+//#include <OneWire.h>
+//#include <DallasTemperature.h>
 
 // Sensor List
 #define TdsSensorPin A1
-#define waterTemperatureSensor A2
+#define TEMPERATURE_SENSOR 8
 #define waterPump1 2
 #define waterPump2 3
 
+// Tags
+#define TDS_TAG "TDS"
+#define SETPOINT_TAG "setpoint"
+#define TEMPERATURE_TAG "temperature"
+
 GravityTDS gravityTds;
 SoftwareSerial s(5, 6);
+//OneWire oneWire(TEMPERATURE_SENSOR);
+//DallasTemperature temperatureSensor(&oneWire);
+
+const char startMarker = '|';
+const char endMarker = '~';
 float temperature = 25, tdsValue = 0, setPoint = 500;
+const byte numChars = 950;
+char receivedChars[numChars];
+bool newData = false;
 
 void setup()
 {
@@ -44,14 +35,16 @@ void setup()
   setupTDS();
   pinMode(waterPump1, OUTPUT);
   pinMode(waterPump2, OUTPUT);
+  pinMode(TEMPERATURE_SENSOR, INPUT);
 }
 
 void loop()
 {
-  detectTemperatureAndTds();
-  checkTdsForWatering();
-  transmitDataToNodeMCU();
-  Serial.println();
+  transmitDataToNodeMCU(tdsValue, setPoint, temperature, startMarker, endMarker);
+  checkTdsForWatering(tdsValue);
+  receiveDataFromNodeMCU(setPoint, startMarker, endMarker);
+
+  Serial.println(".");
   delay(1000);
 }
 
@@ -62,37 +55,117 @@ void setupTDS() {
   gravityTds.begin();  //initialization
 }
 
-void detectTemperatureAndTds() {
-  //TODO add detect temperature code
-  gravityTds.setTemperature(temperature);  // set the temperature and execute temperature compensation
-  gravityTds.update();  //sample and calculate
-  tdsValue = gravityTds.getTdsValue();  // then get the value
-  Serial.print("Nilai Tds: ");
-  Serial.print(tdsValue, 0);
-  Serial.println("ppm");
+//float detectTemperature() {
+//  temperatureSensor.requestTemperatures();
+//  return temperatureSensor.getTempCByIndex(0);
+//}
+
+float detectTds(float temperature) {
+  gravityTds.setTemperature(temperature);
+  gravityTds.update();
+  return gravityTds.getTdsValue();
 }
 
-void checkTdsForWatering() {
+void checkTdsForWatering(float tdsValue) {
   if (tdsValue < setPoint) {
-    digitalWrite(waterPump1, HIGH);
-  } else {
     digitalWrite(waterPump1, LOW);
+    digitalWrite(waterPump2, LOW);
+  } else {
+    digitalWrite(waterPump1, HIGH);
+    digitalWrite(waterPump2, HIGH);
   }
 }
 
-void transmitDataToNodeMCU() {
-  String json, transmittedValue;
-  DynamicJsonBuffer jb;
-  JsonObject& obj = jb.createObject();
-  obj["TDS"] = tdsValue;
-  obj["TDS_setpoint"] = setPoint;
-  obj["temperature"] = temperature;
-  obj.printTo(json);
-  transmittedValue = "^" + json + "~";
-  Serial.println("-----------TRANSMITING data to NodeMCU-----------");
-  Serial.println(transmittedValue);
-  Serial.println("----------------END OF TRANSMITING---------------");
-  s.print(transmittedValue);
-  json.remove(0, json.length());
-  transmittedValue.remove(0, transmittedValue.length());
+void transmitDataToNodeMCU(float& oldTds, float& oldSetPoint, float& oldTemperature, char startMarker, char endMarker) {
+  float tds = detectTds(oldTemperature); // TODO update when temperature is working
+  if (oldTds != tds) {
+    String json, transmittedValue;
+    DynamicJsonBuffer jb;
+    JsonObject& obj = jb.createObject();
+    obj[TDS_TAG] = tds;
+    obj[SETPOINT_TAG] = setPoint;
+    obj[TEMPERATURE_TAG] = temperature;
+    obj.printTo(json);
+    transmittedValue = startMarker + json + endMarker;
+    Serial.println("-----------TRANSMITING data to NodeMCU-----------");
+    Serial.println(transmittedValue);
+    Serial.println("----------------END OF TRANSMITING---------------");
+    s.print(transmittedValue);
+    oldTds = tds;
+  }
+}
+
+void receiveDataFromNodeMCU(float& setPoint, char startMarker, char endMarker) {
+  static boolean recvInProgress = false;
+  static byte ndx = 0;
+  char rc;
+
+  while (s.available() > 0 && newData == false) {
+    rc = s.read();
+
+    if (recvInProgress == true) {
+      if (rc != endMarker) {
+        receivedChars[ndx] = rc;
+        ndx++;
+        if (ndx >= numChars) {
+          ndx = numChars - 1;
+        }
+      }
+      else {
+        receivedChars[ndx] = '\0'; // terminate the string
+        recvInProgress = false;
+        ndx = 0;
+        newData = true;
+        s.flush();
+      }
+    }
+
+    else if (rc == startMarker) {
+      recvInProgress = true;
+    }
+  }
+
+  processNewData(setPoint);
+}
+
+void processNewData(float& setPoint) {
+  if (newData == true) {
+    DynamicJsonBuffer jb;
+    JsonObject& obj = jb.parseObject(receivedChars);
+    if (!obj.success()) {
+      Serial.println("Gagal mengubah json");
+      Serial.println(receivedChars);
+      newData = false;
+      return;
+    }
+    Serial.println("----------------Receiving Object from NodeMCU---------------");
+    obj.prettyPrintTo(Serial);
+    Serial.println("----------------------End of Receiving----------------------");
+    updateSetPoint(obj, setPoint);
+    newData = false;
+  }
+}
+
+void updateSetPoint(JsonObject& obj, float& setPoint) {
+  String receivedSetPoint = obj[SETPOINT_TAG];
+  Serial.println(receivedSetPoint);
+  Serial.println(obj[SETPOINT_TAG] != NULL);
+  Serial.println(isValidNumber(receivedSetPoint));
+  if(obj[SETPOINT_TAG] != NULL && isValidNumber(receivedSetPoint)) {
+    setPoint = obj[SETPOINT_TAG];
+  }
+  Serial.print("current setpoint: ");
+  Serial.print(setPoint);
+}
+
+boolean isValidNumber(String str)
+{
+   boolean isNum=false;
+   if(!(str.charAt(0) == '+' || str.charAt(0) == '-' || isDigit(str.charAt(0)))) return false;
+
+   for(byte i=1;i<str.length();i++)
+   {
+       if(!(isDigit(str.charAt(i)) || str.charAt(i) == '.')) return false;
+   }
+   return true;
 }
